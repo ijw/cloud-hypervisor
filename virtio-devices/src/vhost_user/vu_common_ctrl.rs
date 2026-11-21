@@ -298,6 +298,17 @@ impl VhostUserHandle {
                 .map_err(Error::VhostUserSetBackendRequestFd)?;
         }
 
+        // Kick every ring once now that it is configured and enabled.
+        // The vhost-user spec says a ring starts when the backend receives a
+        // kick, and allows spurious kicks (the backend just finds no new
+        // available buffers). Some backends (e.g. VPP) only mark a ring as
+        // started, and hence the link as up, on the first kick, which a guest
+        // may not send until much later (or ever, e.g. a ring the guest only
+        // fills, or one it uses only to transmit).
+        for (_, _, queue_evt) in queues {
+            queue_evt.write(1).map_err(Error::VhostUserKickVring)?;
+        }
+
         self.vrings_info = Some(vrings_info);
         self.ready = true;
 
@@ -402,10 +413,6 @@ impl VhostUserHandle {
             inflight,
             vring_bases.as_deref(),
         )?;
-
-        for (_, _, queue_evt) in queues {
-            queue_evt.write(1).map_err(Error::VhostUserKickVring)?;
-        }
 
         Ok(())
     }
