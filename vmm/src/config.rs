@@ -378,6 +378,9 @@ pub enum ValidationError {
     /// The vhost-user backend provides the virtio config space
     #[error("guest_block_size is not supported with vhost-user")]
     VhostUserGuestBlockSizeNotSupported,
+    /// The vhost-user backend handles flushes itself
+    #[error("flush=off is not supported with vhost-user")]
+    VhostUserFlushNotSupported,
     /// The specified I/O port was invalid. It should be provided in hex, such as `0xe9`.
     #[cfg(target_arch = "x86_64")]
     #[error("The IO port was not properly provided in hex or a `0x` prefix is missing: {0}")]
@@ -1501,7 +1504,7 @@ impl DiskConfig {
          queue_affinity=<list_of_queue_indices_with_their_associated_cpuset>,\
          serial=<serial_number>,backing_files=on|off,sparse=on|off,\
          image_type=<raw,qcow2,vhd,vhdx,vmdk>,lock_granularity=byte-range|full,\
-         guest_block_size=<size_in_bytes>";
+         guest_block_size=<size_in_bytes>,flush=on|off";
 
     pub fn parse(disk: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
@@ -1529,6 +1532,7 @@ impl DiskConfig {
             .add("image_type")
             .add("lock_granularity")
             .add("guest_block_size")
+            .add("flush")
             .add_all(PciDeviceCommonConfig::OPTIONS_IOMMU);
 
         parser.parse(disk).map_err(Error::ParseDisk)?;
@@ -1630,6 +1634,12 @@ impl DiskConfig {
             .convert::<u32>("guest_block_size")
             .map_err(Error::ParseDisk)?;
 
+        let flush = parser
+            .convert::<Toggle>("flush")
+            .map_err(Error::ParseDisk)?
+            .unwrap_or_else(|| Toggle(default_diskconfig_flush()))
+            .0;
+
         let bw_tb_config = if bw_size != 0 && bw_refill_time != 0 {
             Some(TokenBucketConfig {
                 size: bw_size,
@@ -1684,6 +1694,7 @@ impl DiskConfig {
             image_type,
             lock_granularity,
             guest_block_size,
+            flush,
         })
     }
 
@@ -1728,6 +1739,10 @@ impl DiskConfig {
 
         if self.vhost_user && self.guest_block_size.is_some() {
             return Err(ValidationError::VhostUserGuestBlockSizeNotSupported);
+        }
+
+        if self.vhost_user && !self.flush {
+            return Err(ValidationError::VhostUserFlushNotSupported);
         }
 
         if self.rate_limiter_config.is_some() && self.rate_limit_group.is_some() {
@@ -4646,6 +4661,7 @@ mod tests {
             image_type: ImageType::Unknown,
             lock_granularity: LockGranularityChoice::default(),
             guest_block_size: None,
+            flush: true,
         }
     }
 
@@ -4782,6 +4798,21 @@ mod tests {
             }
         );
         DiskConfig::parse("path=/path/to_file,guest_block_size=abc").unwrap_err();
+        Ok(())
+    }
+
+    #[test]
+    fn test_disk_flush_parsing() -> Result<()> {
+        assert!(DiskConfig::parse("path=/path/to_file")?.flush);
+        assert!(DiskConfig::parse("path=/path/to_file,flush=on")?.flush);
+        assert_eq!(
+            DiskConfig::parse("path=/path/to_file,flush=off")?,
+            DiskConfig {
+                flush: false,
+                ..disk_fixture()
+            }
+        );
+        DiskConfig::parse("path=/path/to_file,flush=maybe").unwrap_err();
         Ok(())
     }
 
@@ -6419,6 +6450,22 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         assert_eq!(
             invalid_config.validate(),
             Err(ValidationError::VhostUserGuestBlockSizeNotSupported)
+        );
+
+        // flush=off cannot take effect when the vhost-user backend handles
+        // the requests.
+        let mut invalid_config = valid_config.clone();
+        invalid_config.memory.shared = true;
+        invalid_config.disks = Some(vec![DiskConfig {
+            path: None,
+            vhost_user: true,
+            vhost_socket: Some("/path/to/sock".to_owned()),
+            flush: false,
+            ..disk_fixture()
+        }]);
+        assert_eq!(
+            invalid_config.validate(),
+            Err(ValidationError::VhostUserFlushNotSupported)
         );
 
         // A queue affinity for a queue the disk does not have is rejected.

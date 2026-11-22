@@ -1256,6 +1256,9 @@ components:
           $ref: "#/components/schemas/LockGranularity"
         guest_block_size:
           type: integer
+        flush:
+          type: boolean
+          default: true
 
     NetConfig:
       type: object

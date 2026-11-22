@@ -188,6 +188,9 @@ struct BlockEpollHandler {
     access_platform: Option<Arc<dyn AccessPlatform>>,
     host_cpus: Option<Box<[usize]>>,
     acked_features: u64,
+    // flush=off: never fsync on the guest's behalf, whatever the negotiated
+    // cache mode, and complete stray Flush requests without touching the disk.
+    ignore_flush: bool,
 }
 
 fn has_feature(features: u64, feature_flag: u64) -> bool {
@@ -303,6 +306,22 @@ impl BlockEpollHandler {
                 continue;
             }
 
+            // With flush=off the guest was never offered a cache to flush, so
+            // a Flush request is complete as soon as it is seen.
+            if self.ignore_flush && request.request_type() == RequestType::Flush {
+                desc_chain
+                    .memory()
+                    .write_obj(VIRTIO_BLK_S_OK as u8, request.status_addr())
+                    .map_err(Error::RequestStatus)?;
+                queue
+                    .add_used(desc_chain.memory(), desc_chain.head_index(), 1)
+                    .map_err(Error::QueueAddUsed)?;
+                queue
+                    .enable_notification(desc_chain.memory())
+                    .map_err(Error::QueueEnableNotification)?;
+                continue;
+            }
+
             if let Some(rate_limiter) = &mut self.rate_limiter {
                 // If limiter.consume() fails it means there is no more TokenType::Ops
                 // budget and rate limiting is in effect.
@@ -334,7 +353,10 @@ impl BlockEpollHandler {
                 }
             }
 
-            request.writeback = self.writeback.load(Ordering::Acquire);
+            // Without FLUSH negotiated the guest is write-through, which makes
+            // writes fsync after every request. flush=off must not do that
+            // either, so it forces the request to be treated as writeback.
+            request.writeback = self.ignore_flush || self.writeback.load(Ordering::Acquire);
 
             let result = request.execute_async(
                 self.mem.memory().into_inner(),
@@ -760,6 +782,7 @@ pub struct Block {
     device_status: Arc<AtomicU8>,
     active_request_count: Arc<AtomicUsize>,
     draining_active_requests: Arc<AtomicBool>,
+    ignore_flush: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -791,6 +814,7 @@ impl Block {
         sparse: bool,
         lock_granularity: LockGranularityChoice,
         guest_block_size: Option<u32>,
+        flush: bool,
     ) -> io::Result<Self> {
         let (disk_nsectors, avail_features, acked_features, config, paused) =
             if let Some(state) = state {
@@ -814,8 +838,6 @@ impl Block {
                 }
 
                 let mut avail_features = (1u64 << VIRTIO_F_VERSION_1)
-                    | (1u64 << VIRTIO_BLK_F_FLUSH)
-                    | (1u64 << VIRTIO_BLK_F_CONFIG_WCE)
                     | (1u64 << VIRTIO_BLK_F_BLK_SIZE)
                     | (1u64 << VIRTIO_BLK_F_TOPOLOGY)
                     | (1u64 << VIRTIO_BLK_F_SEG_MAX)
@@ -836,6 +858,13 @@ impl Block {
                     }
                 } else if sparse {
                     warn!("sparse=on requested but backend does not support sparse operations");
+                }
+
+                // flush=off hides the write cache from the guest entirely: no
+                // FLUSH, and no CONFIG_WCE to switch a cache on.
+                if flush {
+                    avail_features |=
+                        (1u64 << VIRTIO_BLK_F_FLUSH) | (1u64 << VIRTIO_BLK_F_CONFIG_WCE);
                 }
 
                 if access_platform_enabled {
@@ -869,7 +898,7 @@ impl Block {
                 let disk_nsectors = disk_size / SECTOR_SIZE;
                 let mut config = VirtioBlockConfig {
                     capacity: disk_nsectors,
-                    writeback: 1,
+                    writeback: flush as u8,
                     blk_size: topology.logical_block_size as u32,
                     physical_block_exp,
                     min_io_size: (topology.minimum_io_size / logical_block_size) as u16,
@@ -928,6 +957,7 @@ impl Block {
             device_status: Arc::new(AtomicU8::new(0)),
             active_request_count: Arc::new(AtomicUsize::new(0)),
             draining_active_requests: Arc::new(AtomicBool::new(false)),
+            ignore_flush: !flush,
         })
     }
 
@@ -1211,6 +1241,7 @@ impl VirtioDevice for Block {
                 acked_features: self.common.acked_features,
                 active_request_count: Arc::clone(&self.active_request_count),
                 draining_active_requests: Arc::clone(&self.draining_active_requests),
+                ignore_flush: self.ignore_flush,
             };
 
             let paused = Arc::clone(&self.common.paused);
@@ -1236,7 +1267,7 @@ impl VirtioDevice for Block {
         self.common.reset();
         self.draining_active_requests.store(false, Ordering::SeqCst);
         self.active_request_count.store(0, Ordering::SeqCst);
-        self.set_writeback_mode(true);
+        self.set_writeback_mode(!self.ignore_flush);
         event!("virtio-device", "reset", "id", &self.id);
     }
 
@@ -1354,9 +1385,13 @@ impl Migratable for Block {
 
 #[cfg(test)]
 mod tests {
+    use std::fs::File;
     use std::io::Result as IoResult;
 
+    use std::sync::Mutex;
+
     use block::async_io::{AsyncIoCompletion, AsyncIoOperation, AsyncIoResult};
+    use block::formats::raw::{RawBackend, RawDisk};
     use hypervisor::Vm;
     use vm_memory::GuestAddress;
     use vm_virtio::queue::testing::VirtQueue as GuestQ;
@@ -1423,10 +1458,216 @@ mod tests {
             access_platform: None,
             host_cpus: None,
             acked_features: 0,
+            ignore_flush: false,
         };
 
         handler.process_queue_submit().unwrap();
 
         assert_eq!(vq.used.idx.get(), 1);
+    }
+
+    const VRING_DESC_F_NEXT: u32 = 1;
+    const VRING_DESC_F_WRITE: u32 = 2;
+    const HDR: u64 = 0x2000;
+    const DATA: u64 = 0x3000;
+    const STATUS: u64 = 0x4000;
+
+    #[derive(Default)]
+    struct IoLog {
+        submitted: Vec<AsyncIoOperation>,
+        completions: VecDeque<AsyncIoCompletion>,
+        fsyncs: usize,
+    }
+
+    /// An AsyncIo that records what the handler asks of it.
+    struct Recording(EventFd, Arc<Mutex<IoLog>>);
+    impl AsyncIo for Recording {
+        fn notifier(&self) -> &EventFd {
+            &self.0
+        }
+        fn submit_data_operation(&mut self, op: AsyncIoOperation) -> AsyncIoResult<()> {
+            self.1.lock().unwrap().submitted.push(op);
+            Ok(())
+        }
+        fn fsync(&mut self, _: Option<u64>) -> AsyncIoResult<()> {
+            self.1.lock().unwrap().fsyncs += 1;
+            Ok(())
+        }
+        fn punch_hole(&mut self, _: u64, _: u64, _: u64) -> AsyncIoResult<()> {
+            unreachable!()
+        }
+        fn write_zeroes(&mut self, _: u64, _: u64, _: u64) -> AsyncIoResult<()> {
+            unreachable!()
+        }
+        fn next_completed_request(&mut self) -> Option<AsyncIoCompletion> {
+            self.1.lock().unwrap().completions.pop_front()
+        }
+    }
+
+    /// Lay out one request (header, optional data, status) with its head at
+    /// descriptor `head`, and publish it on the avail ring at slot `slot`.
+    fn queue_request(
+        mem: &GuestMemoryMmap,
+        vq: &GuestQ,
+        head: u16,
+        slot: usize,
+        request_type: u32,
+        sector: u64,
+        data_len: u32,
+    ) {
+        mem.write_obj(request_type, GuestAddress(HDR)).unwrap();
+        mem.write_obj(sector, GuestAddress(HDR + 8)).unwrap();
+        mem.write_obj(0xffu8, GuestAddress(STATUS)).unwrap();
+        let h = head as usize;
+        vq.dtable[h].set(HDR, 16, VRING_DESC_F_NEXT as u16, head + 1);
+        if data_len > 0 {
+            let flags = if request_type == VIRTIO_BLK_T_IN {
+                VRING_DESC_F_NEXT | VRING_DESC_F_WRITE
+            } else {
+                VRING_DESC_F_NEXT
+            };
+            vq.dtable[h + 1].set(DATA, data_len, flags as u16, head + 2);
+            vq.dtable[h + 2].set(STATUS, 1, VRING_DESC_F_WRITE as u16, 0);
+        } else {
+            vq.dtable[h + 1].set(STATUS, 1, VRING_DESC_F_WRITE as u16, 0);
+        }
+        vq.avail.ring[slot].set(head);
+        vq.avail.idx.set(slot as u16 + 1);
+    }
+
+    fn test_handler(
+        mem: &GuestMemoryMmap,
+        vq: &GuestQ,
+        io: Box<dyn AsyncIo>,
+        writeback: bool,
+        ignore_flush: bool,
+    ) -> BlockEpollHandler {
+        let evt = || EventFd::new(EFD_NONBLOCK).unwrap();
+        BlockEpollHandler {
+            queue_index: 0,
+            queue: vq.create_queue(),
+            mem: GuestMemoryAtomic::new(mem.clone()),
+            disk_image: io,
+            disk_nsectors: Arc::new(AtomicU64::new(1024)),
+            interrupt_cb: Arc::new(Noop(evt())),
+            serial: Box::default(),
+            kill_evt: evt(),
+            pause_evt: evt(),
+            writeback: Arc::new(AtomicBool::new(writeback)),
+            counters: BlockCounters::default(),
+            queue_evt: evt(),
+            inflight_requests: VecDeque::new(),
+            active_request_count: Arc::new(AtomicUsize::new(0)),
+            draining_active_requests: Arc::new(AtomicBool::new(false)),
+            rate_limiter: None,
+            access_platform: None,
+            host_cpus: None,
+            acked_features: 0,
+            ignore_flush,
+        }
+    }
+
+    fn memfd_disk(len: u64) -> File {
+        use std::os::fd::FromRawFd;
+        // SAFETY: the name is a valid C string and the fd is owned below.
+        let fd = unsafe { libc::memfd_create(c"block-test".as_ptr(), 0) };
+        assert!(fd >= 0);
+        // SAFETY: fd was just created and is not used elsewhere.
+        let file = unsafe { File::from_raw_fd(fd) };
+        file.set_len(len).unwrap();
+        file
+    }
+
+    #[test]
+    fn flush_request_is_completed_without_fsync_when_ignoring_flush() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let vq = GuestQ::new(GuestAddress(0x1000), &mem, 8);
+        queue_request(&mem, &vq, 0, 0, VIRTIO_BLK_T_FLUSH, 0, 0);
+
+        let log = Arc::new(Mutex::new(IoLog::default()));
+        let io = Box::new(Recording(EventFd::new(EFD_NONBLOCK).unwrap(), Arc::clone(&log)));
+        let mut handler = test_handler(&mem, &vq, io, false, true);
+        handler.process_queue_submit().unwrap();
+
+        assert_eq!(vq.used.idx.get(), 1);
+        assert_eq!(mem.read_obj::<u8>(GuestAddress(STATUS)).unwrap(), 0);
+        let log = log.lock().unwrap();
+        assert_eq!(log.fsyncs, 0);
+        assert!(log.submitted.is_empty());
+    }
+
+    /// Run one 4K write through submit and completion and return the number
+    /// of host fsyncs it caused.
+    fn fsyncs_for_one_write(writeback: bool, ignore_flush: bool) -> usize {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let vq = GuestQ::new(GuestAddress(0x1000), &mem, 8);
+        queue_request(&mem, &vq, 0, 0, VIRTIO_BLK_T_OUT, 0, 4096);
+
+        let log = Arc::new(Mutex::new(IoLog::default()));
+        let io = Box::new(Recording(EventFd::new(EFD_NONBLOCK).unwrap(), Arc::clone(&log)));
+        let mut handler = test_handler(&mem, &vq, io, writeback, ignore_flush);
+        handler.process_queue_submit().unwrap();
+
+        let op = log.lock().unwrap().submitted.pop().unwrap();
+        log.lock()
+            .unwrap()
+            .completions
+            .push_back(AsyncIoCompletion::from_operation(op, 4096));
+        handler.process_queue_complete().unwrap();
+
+        assert_eq!(vq.used.idx.get(), 1);
+        let log = log.lock().unwrap();
+        log.fsyncs
+    }
+
+    #[test]
+    fn write_fsyncs_per_request_in_writethrough_mode() {
+        // Control for the test below: FLUSH unnegotiated means the writeback
+        // flag is false, and a plain device then fsyncs after every write.
+        assert_eq!(fsyncs_for_one_write(false, false), 1);
+    }
+
+    #[test]
+    fn write_does_not_fsync_when_ignoring_flush() {
+        // flush=off never negotiates FLUSH, so the writeback flag is false,
+        // yet no write may be followed by an fsync.
+        assert_eq!(fsyncs_for_one_write(false, true), 0);
+    }
+
+    #[test]
+    fn flush_off_hides_flush_and_write_cache_features() {
+        let new_block = |flush| {
+            Block::new(
+                "test".to_owned(),
+                Box::new(RawDisk::new(memfd_disk(1 << 20), RawBackend::Sync, false)),
+                PathBuf::from("/test"),
+                false,
+                false,
+                1,
+                128,
+                None,
+                SeccompAction::Allow,
+                None,
+                EventFd::new(EFD_NONBLOCK).unwrap(),
+                None,
+                BTreeMap::new(),
+                true,
+                LockGranularityChoice::default(),
+                None,
+                flush,
+            )
+            .unwrap()
+        };
+
+        let flush_bits = (1u64 << VIRTIO_BLK_F_FLUSH) | (1u64 << VIRTIO_BLK_F_CONFIG_WCE);
+        let on = new_block(true);
+        assert_eq!(on.common.avail_features & flush_bits, flush_bits);
+        assert_eq!(on.config.writeback, 1);
+        assert!(!on.ignore_flush);
+
+        let off = new_block(false);
+        assert_eq!(off.common.avail_features & flush_bits, 0);
+        assert_eq!(off.config.writeback, 0);
+        assert!(off.ignore_flush);
     }
 }

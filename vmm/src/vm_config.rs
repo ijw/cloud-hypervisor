@@ -486,6 +486,8 @@ pub struct DiskConfig {
     pub lock_granularity: LockGranularityChoice,
     #[serde(default)]
     pub guest_block_size: Option<u32>,
+    #[serde(default = "default_diskconfig_flush")]
+    pub flush: bool,
 }
 
 impl ApplyLandlock for DiskConfig {
@@ -510,6 +512,10 @@ pub fn default_diskconfig_queue_size() -> u16 {
 }
 
 pub fn default_diskconfig_sparse() -> bool {
+    true
+}
+
+pub fn default_diskconfig_flush() -> bool {
     true
 }
 
