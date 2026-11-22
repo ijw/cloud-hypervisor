@@ -110,7 +110,6 @@ impl AlignedFile {
 
     /// Wrap `file` with an explicit alignment, bypassing the probe. Used by
     /// tests to force the bounce/RMW path without a real O_DIRECT fd.
-    #[cfg(test)]
     pub fn with_alignment(file: File, alignment: Option<usize>) -> Self {
         AlignedFile { file, alignment }
     }
@@ -144,7 +143,13 @@ impl AlignedFile {
         let mut abuf = AlignedBuffer::new(offset, len, alignment)?;
         abuf.read_from(&self.file)?; // RMW: preserve head/tail padding
         gather(abuf.as_mut_slice())?;
-        abuf.write_to(&self.file)?;
+        // The tail sector may extend past EOF (file size not a multiple of the
+        // alignment). Never grow the file beyond what the caller wrote: clamp
+        // to the current size (fstat now, so a resize is honoured), or to the
+        // end of the caller's data when that itself extends the file.
+        let size = self.file.metadata()?.len();
+        let limit = size.max(offset.saturating_add(len as u64));
+        abuf.write_to_limit(&self.file, limit)?;
         Ok(len)
     }
 
@@ -479,6 +484,23 @@ mod tests {
         assert_eq!(&whole[100..300], &data[..]);
         let after: Vec<u8> = (300..8192).map(|i| (i % 251) as u8).collect();
         assert_eq!(&whole[300..], &after[..]);
+    }
+
+    #[test]
+    fn write_unaligned_tail_does_not_extend_file() {
+        // 4096*2 + 512: the last 512-byte sector sits in a partial 4096 block.
+        let size = 4096 * 2 + 512;
+        let tf = pattern_file(size);
+        let af = forced(tf.as_file().try_clone().unwrap(), Some(4096));
+        let data = vec![0xabu8; 512];
+        assert_eq!(af.write_at(&data, 8192).unwrap(), 512);
+
+        assert_eq!(tf.as_file().metadata().unwrap().len(), size as u64);
+        let mut whole = vec![0u8; size];
+        tf.as_file().read_exact_at(&mut whole, 0).unwrap();
+        let before: Vec<u8> = (0..8192).map(|i| (i % 251) as u8).collect();
+        assert_eq!(&whole[..8192], &before[..]);
+        assert_eq!(&whole[8192..], &data[..]);
     }
 
     #[test]

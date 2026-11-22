@@ -123,8 +123,18 @@ impl AlignedBuffer {
     }
 
     /// Write the full aligned region from this buffer to `f`.
+    #[cfg(test)]
     pub(crate) fn write_to(&self, f: &impl FileExt) -> io::Result<()> {
         f.write_all_at(self.full_slice(), self.aligned_offset)
+    }
+
+    /// Write the aligned region to `f`, but never at or beyond file offset
+    /// `limit`: tail padding past it is dropped so the file is not extended.
+    /// `limit` must be at least the end of the caller's logical data.
+    pub(crate) fn write_to_limit(&self, f: &impl FileExt, limit: u64) -> io::Result<()> {
+        let avail = limit.saturating_sub(self.aligned_offset);
+        let n = (self.aligned_len as u64).min(avail) as usize;
+        f.write_all_at(&self.full_slice()[..n], self.aligned_offset)
     }
 }
 
@@ -265,5 +275,18 @@ mod tests {
         let after_start = offset as usize + len;
         let after: Vec<u8> = (after_start..file_size).map(|i| (i % 251) as u8).collect();
         assert_eq!(&whole[after_start..], &after[..]);
+    }
+
+    #[test]
+    fn test_write_to_limit_does_not_extend() {
+        let tf = create_pattern_file(1024 + 100);
+        let mut abuf = AlignedBuffer::new(1024, 50, 512).unwrap();
+        abuf.read_from(tf.as_file()).unwrap();
+        abuf.as_mut_slice().fill(0xee);
+        abuf.write_to_limit(tf.as_file(), 1124).unwrap();
+        assert_eq!(tf.as_file().metadata().unwrap().len(), 1124);
+        let mut b = [0u8; 50];
+        tf.as_file().read_exact_at(&mut b, 1024).unwrap();
+        assert_eq!(b, [0xee; 50]);
     }
 }

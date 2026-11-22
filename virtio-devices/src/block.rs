@@ -27,7 +27,7 @@ use block::disk_file::AsyncFullDiskFile;
 use block::error::BlockError;
 use block::fcntl::{LockError, LockGranularity, LockGranularityChoice, LockType, get_lock_state};
 use block::{
-    ExecuteAsync, ExecuteError, MAX_DISCARD_WRITE_ZEROES_SEG, Request, RequestType,
+    AlignedFile, ExecuteAsync, ExecuteError, MAX_DISCARD_WRITE_ZEROES_SEG, Request, RequestType,
     VirtioBlockConfig, build_serial, fcntl,
 };
 use event_monitor::event;
@@ -191,6 +191,10 @@ struct BlockEpollHandler {
     // flush=off: never fsync on the guest's behalf, whatever the negotiated
     // cache mode, and complete stray Flush requests without touching the disk.
     ignore_flush: bool,
+    // Set when the guest block size is below the backend's O_DIRECT alignment.
+    // Requests that are not aligned for the backend are run synchronously
+    // through this file, once nothing else is in flight on the queue.
+    unaligned_file: Option<AlignedFile>,
 }
 
 fn has_feature(features: u64, feature_flag: u64) -> bool {
@@ -322,6 +326,19 @@ impl BlockEpollHandler {
                 continue;
             }
 
+            // A request the backend cannot take as-is is emulated with a
+            // read-modify-write on the file. That would race with any other
+            // request in flight on this queue, so wait until they complete;
+            // the completion event runs the submit path again. This is only
+            // sound with a single queue, which Block::new enforces.
+            let emulate = self.unaligned_file.is_some()
+                && matches!(request.request_type(), RequestType::In | RequestType::Out)
+                && !request.data_is_aligned(self.disk_image.alignment());
+            if emulate && (!self.inflight_requests.is_empty() || !batch_requests.is_empty()) {
+                queue.go_to_previous_position();
+                break;
+            }
+
             if let Some(rate_limiter) = &mut self.rate_limiter {
                 // If limiter.consume() fails it means there is no more TokenType::Ops
                 // budget and rate limiting is in effect.
@@ -357,6 +374,51 @@ impl BlockEpollHandler {
             // writes fsync after every request. flush=off must not do that
             // either, so it forces the request to be treated as writeback.
             request.writeback = self.ignore_flush || self.writeback.load(Ordering::Acquire);
+
+            if emulate && let Some(file) = self.unaligned_file.as_mut() {
+                let mem = self.mem.memory();
+                let result = request.execute(
+                    file,
+                    self.disk_nsectors.load(Ordering::SeqCst),
+                    mem.deref(),
+                    &self.serial,
+                );
+                let (status, len) = match result {
+                    Ok(len) => {
+                        // Latency statistics are not tracked on this path.
+                        let bytes = u64::from(len);
+                        if request.request_type() == RequestType::In {
+                            self.counters.read_ops.fetch_add(1, Ordering::AcqRel);
+                            self.counters.read_bytes.fetch_add(bytes, Ordering::AcqRel);
+                            (VIRTIO_BLK_S_OK as u8, len + 1)
+                        } else {
+                            self.counters.write_ops.fetch_add(1, Ordering::AcqRel);
+                            let written: u64 = request
+                                .data_descriptors()
+                                .iter()
+                                .map(|(_, data_len)| u64::from(*data_len))
+                                .sum();
+                            self.counters
+                                .write_bytes
+                                .fetch_add(written, Ordering::AcqRel);
+                            (VIRTIO_BLK_S_OK as u8, 1)
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Request failed: {request:x?} {e:?}");
+                        (e.status(), 1)
+                    }
+                };
+                mem.write_obj(status, request.status_addr())
+                    .map_err(Error::RequestStatus)?;
+                queue
+                    .add_used(mem.deref(), desc_chain.head_index(), len)
+                    .map_err(Error::QueueAddUsed)?;
+                queue
+                    .enable_notification(mem.deref())
+                    .map_err(Error::QueueEnableNotification)?;
+                continue;
+            }
 
             let result = request.execute_async(
                 self.mem.memory().into_inner(),
@@ -783,6 +845,7 @@ pub struct Block {
     active_request_count: Arc<AtomicUsize>,
     draining_active_requests: Arc<AtomicBool>,
     ignore_flush: bool,
+    emulate_unaligned: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -792,6 +855,17 @@ pub struct BlockState {
     pub avail_features: u64,
     pub acked_features: u64,
     pub config: VirtioBlockConfig,
+}
+
+/// Whether a guest block size is served by sub-alignment emulation: only when
+/// it is below the backend's logical block size and the backend does direct
+/// I/O (a buffered backend accepts any size).
+fn needs_unaligned_emulation(
+    guest_block_size: Option<u32>,
+    backend_logical: u64,
+    direct: bool,
+) -> bool {
+    direct && guest_block_size.is_some_and(|size| u64::from(size) < backend_logical)
 }
 
 impl Block {
@@ -816,115 +890,134 @@ impl Block {
         guest_block_size: Option<u32>,
         flush: bool,
     ) -> io::Result<Self> {
-        let (disk_nsectors, avail_features, acked_features, config, paused) =
-            if let Some(state) = state {
-                info!("Restoring virtio-block {id}");
-                (
-                    state.disk_nsectors,
-                    state.avail_features,
-                    state.acked_features,
-                    state.config,
-                    true,
-                )
-            } else {
-                let disk_size = disk_image
-                    .logical_size()
-                    .map_err(|e| io::Error::other(format!("Failed getting disk size: {e}")))?;
-                if disk_size % SECTOR_SIZE != 0 {
-                    warn!(
-                        "Disk size {disk_size} is not a multiple of sector size {SECTOR_SIZE}; \
+        let (disk_nsectors, avail_features, acked_features, config, paused) = if let Some(state) =
+            state
+        {
+            info!("Restoring virtio-block {id}");
+            (
+                state.disk_nsectors,
+                state.avail_features,
+                state.acked_features,
+                state.config,
+                true,
+            )
+        } else {
+            let disk_size = disk_image
+                .logical_size()
+                .map_err(|e| io::Error::other(format!("Failed getting disk size: {e}")))?;
+            if disk_size % SECTOR_SIZE != 0 {
+                warn!(
+                    "Disk size {disk_size} is not a multiple of sector size {SECTOR_SIZE}; \
                  the remainder will not be visible to the guest."
-                    );
+                );
+            }
+
+            let mut avail_features = (1u64 << VIRTIO_F_VERSION_1)
+                | (1u64 << VIRTIO_BLK_F_BLK_SIZE)
+                | (1u64 << VIRTIO_BLK_F_TOPOLOGY)
+                | (1u64 << VIRTIO_BLK_F_SEG_MAX)
+                | (1u64 << VIRTIO_RING_F_EVENT_IDX)
+                | (1u64 << VIRTIO_RING_F_INDIRECT_DESC);
+
+            // When backend supports sparse operations:
+            // - Always advertise WRITE_ZEROES (safe for all drivers)
+            // - Advertise DISCARD only when sparse=true, since DISCARD
+            //   deallocates space via punch_hole and should require
+            //   explicit user opt in.
+            let mut discard_supported = false;
+            if disk_image.supports_sparse_operations() {
+                avail_features |= 1u64 << VIRTIO_BLK_F_WRITE_ZEROES;
+                if sparse {
+                    avail_features |= 1u64 << VIRTIO_BLK_F_DISCARD;
+                    discard_supported = true;
                 }
+            } else if sparse {
+                warn!("sparse=on requested but backend does not support sparse operations");
+            }
 
-                let mut avail_features = (1u64 << VIRTIO_F_VERSION_1)
-                    | (1u64 << VIRTIO_BLK_F_BLK_SIZE)
-                    | (1u64 << VIRTIO_BLK_F_TOPOLOGY)
-                    | (1u64 << VIRTIO_BLK_F_SEG_MAX)
-                    | (1u64 << VIRTIO_RING_F_EVENT_IDX)
-                    | (1u64 << VIRTIO_RING_F_INDIRECT_DESC);
+            // flush=off hides the write cache from the guest entirely: no
+            // FLUSH, and no CONFIG_WCE to switch a cache on.
+            if flush {
+                avail_features |= (1u64 << VIRTIO_BLK_F_FLUSH) | (1u64 << VIRTIO_BLK_F_CONFIG_WCE);
+            }
 
-                // When backend supports sparse operations:
-                // - Always advertise WRITE_ZEROES (safe for all drivers)
-                // - Advertise DISCARD only when sparse=true, since DISCARD
-                //   deallocates space via punch_hole and should require
-                //   explicit user opt in.
-                let mut discard_supported = false;
-                if disk_image.supports_sparse_operations() {
-                    avail_features |= 1u64 << VIRTIO_BLK_F_WRITE_ZEROES;
-                    if sparse {
-                        avail_features |= 1u64 << VIRTIO_BLK_F_DISCARD;
-                        discard_supported = true;
-                    }
-                } else if sparse {
-                    warn!("sparse=on requested but backend does not support sparse operations");
-                }
+            if access_platform_enabled {
+                avail_features |= 1u64 << VIRTIO_F_ACCESS_PLATFORM;
+            }
 
-                // flush=off hides the write cache from the guest entirely: no
-                // FLUSH, and no CONFIG_WCE to switch a cache on.
-                if flush {
-                    avail_features |=
-                        (1u64 << VIRTIO_BLK_F_FLUSH) | (1u64 << VIRTIO_BLK_F_CONFIG_WCE);
-                }
+            if read_only {
+                avail_features |= 1u64 << VIRTIO_BLK_F_RO;
+            }
 
-                if access_platform_enabled {
-                    avail_features |= 1u64 << VIRTIO_F_ACCESS_PLATFORM;
-                }
+            let mut topology = disk_image.topology();
+            if let Some(block_size) = guest_block_size {
+                topology = topology.with_block_size(block_size as u64);
+            }
+            info!("Disk topology: {topology:?}");
 
-                if read_only {
-                    avail_features |= 1u64 << VIRTIO_BLK_F_RO;
-                }
-
-                let mut topology = disk_image.topology();
-                if let Some(block_size) = guest_block_size {
-                    topology = topology.with_block_size(block_size as u64);
-                }
-                info!("Disk topology: {topology:?}");
-
-                let logical_block_size = if topology.logical_block_size > 512 {
-                    topology.logical_block_size
-                } else {
-                    512
-                };
-
-                // Calculate the exponent that maps physical block to logical block
-                let mut physical_block_exp = 0;
-                let mut size = logical_block_size;
-                while size < topology.physical_block_size {
-                    physical_block_exp += 1;
-                    size <<= 1;
-                }
-
-                let disk_nsectors = disk_size / SECTOR_SIZE;
-                let mut config = VirtioBlockConfig {
-                    capacity: disk_nsectors,
-                    writeback: flush as u8,
-                    blk_size: topology.logical_block_size as u32,
-                    physical_block_exp,
-                    min_io_size: (topology.minimum_io_size / logical_block_size) as u16,
-                    opt_io_size: (topology.optimal_io_size / logical_block_size) as u32,
-                    seg_max: (queue_size - MINIMUM_BLOCK_QUEUE_SIZE) as u32,
-                    ..Default::default()
-                };
-
-                if avail_features & (1u64 << VIRTIO_BLK_F_WRITE_ZEROES) != 0 {
-                    config.max_write_zeroes_sectors = u32::MAX;
-                    config.max_write_zeroes_seg = MAX_DISCARD_WRITE_ZEROES_SEG;
-                    config.write_zeroes_may_unmap = if discard_supported { 1 } else { 0 };
-                }
-                if avail_features & (1u64 << VIRTIO_BLK_F_DISCARD) != 0 {
-                    config.max_discard_sectors = u32::MAX;
-                    config.max_discard_seg = MAX_DISCARD_WRITE_ZEROES_SEG;
-                    config.discard_sector_alignment = (logical_block_size / SECTOR_SIZE) as u32;
-                }
-
-                if num_queues > 1 {
-                    avail_features |= 1u64 << VIRTIO_BLK_F_MQ;
-                    config.num_queues = num_queues as u16;
-                }
-
-                (disk_nsectors, avail_features, 0, config, false)
+            let logical_block_size = if topology.logical_block_size > 512 {
+                topology.logical_block_size
+            } else {
+                512
             };
+
+            // Calculate the exponent that maps physical block to logical block
+            let mut physical_block_exp = 0;
+            let mut size = logical_block_size;
+            while size < topology.physical_block_size {
+                physical_block_exp += 1;
+                size <<= 1;
+            }
+
+            let disk_nsectors = disk_size / SECTOR_SIZE;
+            let mut config = VirtioBlockConfig {
+                capacity: disk_nsectors,
+                writeback: flush as u8,
+                blk_size: topology.logical_block_size as u32,
+                physical_block_exp,
+                min_io_size: (topology.minimum_io_size / logical_block_size) as u16,
+                opt_io_size: (topology.optimal_io_size / logical_block_size) as u32,
+                seg_max: (queue_size - MINIMUM_BLOCK_QUEUE_SIZE) as u32,
+                ..Default::default()
+            };
+
+            if avail_features & (1u64 << VIRTIO_BLK_F_WRITE_ZEROES) != 0 {
+                config.max_write_zeroes_sectors = u32::MAX;
+                config.max_write_zeroes_seg = MAX_DISCARD_WRITE_ZEROES_SEG;
+                config.write_zeroes_may_unmap = if discard_supported { 1 } else { 0 };
+            }
+            if avail_features & (1u64 << VIRTIO_BLK_F_DISCARD) != 0 {
+                config.max_discard_sectors = u32::MAX;
+                config.max_discard_seg = MAX_DISCARD_WRITE_ZEROES_SEG;
+                config.discard_sector_alignment = (logical_block_size / SECTOR_SIZE) as u32;
+            }
+
+            if num_queues > 1 {
+                avail_features |= 1u64 << VIRTIO_BLK_F_MQ;
+                config.num_queues = num_queues as u16;
+            }
+
+            (disk_nsectors, avail_features, 0, config, false)
+        };
+
+        // A guest block size below the backend's block size is only a problem
+        // for direct I/O, where the engines need aligned requests; it is then
+        // served by emulating the sub-alignment I/O, see BlockEpollHandler.
+        // Without direct I/O (no unaligned_io_file) the backend takes any size.
+        let direct = disk_image
+            .unaligned_io_file()
+            .map_err(|e| io::Error::other(format!("Failed preparing unaligned I/O: {e}")))?
+            .is_some();
+        let emulate_unaligned = needs_unaligned_emulation(
+            guest_block_size,
+            disk_image.topology().logical_block_size,
+            direct,
+        );
+        if emulate_unaligned && num_queues != 1 {
+            return Err(io::Error::other(
+                "guest_block_size below the backend block size requires a single queue",
+            ));
+        }
 
         let serial = serial
             .map_or_else(|| build_serial(&disk_path), Vec::from)
@@ -958,6 +1051,7 @@ impl Block {
             active_request_count: Arc::new(AtomicUsize::new(0)),
             draining_active_requests: Arc::new(AtomicBool::new(false)),
             ignore_flush: !flush,
+            emulate_unaligned,
         })
     }
 
@@ -1242,6 +1336,14 @@ impl VirtioDevice for Block {
                 active_request_count: Arc::clone(&self.active_request_count),
                 draining_active_requests: Arc::clone(&self.draining_active_requests),
                 ignore_flush: self.ignore_flush,
+                unaligned_file: if self.emulate_unaligned {
+                    self.disk_image.unaligned_io_file().map_err(|e| {
+                        error!("failed to create unaligned I/O file: {e}");
+                        ActivateError::BadActivate
+                    })?
+                } else {
+                    None
+                },
             };
 
             let paused = Arc::clone(&self.common.paused);
@@ -1387,7 +1489,8 @@ impl Migratable for Block {
 mod tests {
     use std::fs::File;
     use std::io::Result as IoResult;
-
+    use std::os::fd::FromRawFd;
+    use std::os::unix::fs::FileExt;
     use std::sync::Mutex;
 
     use block::async_io::{AsyncIoCompletion, AsyncIoOperation, AsyncIoResult};
@@ -1459,6 +1562,7 @@ mod tests {
             host_cpus: None,
             acked_features: 0,
             ignore_flush: false,
+            unaligned_file: None,
         };
 
         handler.process_queue_submit().unwrap();
@@ -1468,9 +1572,17 @@ mod tests {
 
     const VRING_DESC_F_NEXT: u32 = 1;
     const VRING_DESC_F_WRITE: u32 = 2;
-    const HDR: u64 = 0x2000;
-    const DATA: u64 = 0x3000;
-    const STATUS: u64 = 0x4000;
+    // Each request, identified by its head descriptor, gets its own header,
+    // status byte and 4K data buffer.
+    fn hdr_addr(head: u16) -> u64 {
+        0x2000 + u64::from(head) * 0x20
+    }
+    fn status_addr(head: u16) -> u64 {
+        0x2800 + u64::from(head)
+    }
+    fn data_addr(head: u16) -> u64 {
+        0x3000 + u64::from(head) * 0x1000
+    }
 
     #[derive(Default)]
     struct IoLog {
@@ -1502,6 +1614,9 @@ mod tests {
         fn next_completed_request(&mut self) -> Option<AsyncIoCompletion> {
             self.1.lock().unwrap().completions.pop_front()
         }
+        fn alignment(&self) -> Option<u64> {
+            Some(4096)
+        }
     }
 
     /// Lay out one request (header, optional data, status) with its head at
@@ -1515,24 +1630,34 @@ mod tests {
         sector: u64,
         data_len: u32,
     ) {
-        mem.write_obj(request_type, GuestAddress(HDR)).unwrap();
-        mem.write_obj(sector, GuestAddress(HDR + 8)).unwrap();
-        mem.write_obj(0xffu8, GuestAddress(STATUS)).unwrap();
+        mem.write_obj(request_type, GuestAddress(hdr_addr(head)))
+            .unwrap();
+        mem.write_obj(sector, GuestAddress(hdr_addr(head) + 8))
+            .unwrap();
+        mem.write_obj(0xffu8, GuestAddress(status_addr(head)))
+            .unwrap();
         let h = head as usize;
-        vq.dtable[h].set(HDR, 16, VRING_DESC_F_NEXT as u16, head + 1);
+        vq.dtable[h].set(hdr_addr(head), 16, VRING_DESC_F_NEXT as u16, head + 1);
         if data_len > 0 {
             let flags = if request_type == VIRTIO_BLK_T_IN {
                 VRING_DESC_F_NEXT | VRING_DESC_F_WRITE
             } else {
                 VRING_DESC_F_NEXT
             };
-            vq.dtable[h + 1].set(DATA, data_len, flags as u16, head + 2);
-            vq.dtable[h + 2].set(STATUS, 1, VRING_DESC_F_WRITE as u16, 0);
+            vq.dtable[h + 1].set(data_addr(head), data_len, flags as u16, head + 2);
+            vq.dtable[h + 2].set(status_addr(head), 1, VRING_DESC_F_WRITE as u16, 0);
         } else {
-            vq.dtable[h + 1].set(STATUS, 1, VRING_DESC_F_WRITE as u16, 0);
+            vq.dtable[h + 1].set(status_addr(head), 1, VRING_DESC_F_WRITE as u16, 0);
         }
         vq.avail.ring[slot].set(head);
         vq.avail.idx.set(slot as u16 + 1);
+    }
+
+    fn recording(log: &Arc<Mutex<IoLog>>) -> Box<Recording> {
+        Box::new(Recording(
+            EventFd::new(EFD_NONBLOCK).unwrap(),
+            Arc::clone(log),
+        ))
     }
 
     fn test_handler(
@@ -1541,6 +1666,7 @@ mod tests {
         io: Box<dyn AsyncIo>,
         writeback: bool,
         ignore_flush: bool,
+        unaligned_file: Option<AlignedFile>,
     ) -> BlockEpollHandler {
         let evt = || EventFd::new(EFD_NONBLOCK).unwrap();
         BlockEpollHandler {
@@ -1564,11 +1690,11 @@ mod tests {
             host_cpus: None,
             acked_features: 0,
             ignore_flush,
+            unaligned_file,
         }
     }
 
     fn memfd_disk(len: u64) -> File {
-        use std::os::fd::FromRawFd;
         // SAFETY: the name is a valid C string and the fd is owned below.
         let fd = unsafe { libc::memfd_create(c"block-test".as_ptr(), 0) };
         assert!(fd >= 0);
@@ -1585,12 +1711,12 @@ mod tests {
         queue_request(&mem, &vq, 0, 0, VIRTIO_BLK_T_FLUSH, 0, 0);
 
         let log = Arc::new(Mutex::new(IoLog::default()));
-        let io = Box::new(Recording(EventFd::new(EFD_NONBLOCK).unwrap(), Arc::clone(&log)));
-        let mut handler = test_handler(&mem, &vq, io, false, true);
+        let io = recording(&log);
+        let mut handler = test_handler(&mem, &vq, io, false, true, None);
         handler.process_queue_submit().unwrap();
 
         assert_eq!(vq.used.idx.get(), 1);
-        assert_eq!(mem.read_obj::<u8>(GuestAddress(STATUS)).unwrap(), 0);
+        assert_eq!(mem.read_obj::<u8>(GuestAddress(status_addr(0))).unwrap(), 0);
         let log = log.lock().unwrap();
         assert_eq!(log.fsyncs, 0);
         assert!(log.submitted.is_empty());
@@ -1604,8 +1730,8 @@ mod tests {
         queue_request(&mem, &vq, 0, 0, VIRTIO_BLK_T_OUT, 0, 4096);
 
         let log = Arc::new(Mutex::new(IoLog::default()));
-        let io = Box::new(Recording(EventFd::new(EFD_NONBLOCK).unwrap(), Arc::clone(&log)));
-        let mut handler = test_handler(&mem, &vq, io, writeback, ignore_flush);
+        let io = recording(&log);
+        let mut handler = test_handler(&mem, &vq, io, writeback, ignore_flush, None);
         handler.process_queue_submit().unwrap();
 
         let op = log.lock().unwrap().submitted.pop().unwrap();
@@ -1669,5 +1795,157 @@ mod tests {
         assert_eq!(off.common.avail_features & flush_bits, 0);
         assert_eq!(off.config.writeback, 0);
         assert!(off.ignore_flush);
+    }
+
+    #[test]
+    fn sub_alignment_write_is_emulated_synchronously() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let vq = GuestQ::new(GuestAddress(0x1000), &mem, 8);
+        let file = memfd_disk(0x10000);
+        file.write_all_at(&[0xaa; 8192], 0).unwrap();
+        mem.write_slice(&[0x55; 512], GuestAddress(data_addr(0)))
+            .unwrap();
+        queue_request(&mem, &vq, 0, 0, VIRTIO_BLK_T_OUT, 1, 512);
+
+        let log = Arc::new(Mutex::new(IoLog::default()));
+        let io = recording(&log);
+        let aligned = AlignedFile::with_alignment(file.try_clone().unwrap(), Some(4096));
+        let mut handler = test_handler(&mem, &vq, io, true, false, Some(aligned));
+        handler.process_queue_submit().unwrap();
+
+        // Completed inline: nothing went to the async engine.
+        assert_eq!(vq.used.idx.get(), 1);
+        assert_eq!(mem.read_obj::<u8>(GuestAddress(status_addr(0))).unwrap(), 0);
+        assert!(log.lock().unwrap().submitted.is_empty());
+        assert!(handler.inflight_requests.is_empty());
+
+        let mut got = vec![0u8; 8192];
+        file.read_exact_at(&mut got, 0).unwrap();
+        assert!(got[..512].iter().all(|b| *b == 0xaa));
+        assert!(got[512..1024].iter().all(|b| *b == 0x55));
+        assert!(got[1024..].iter().all(|b| *b == 0xaa));
+    }
+
+    #[test]
+    fn sub_alignment_read_is_emulated_synchronously() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let vq = GuestQ::new(GuestAddress(0x1000), &mem, 8);
+        let file = memfd_disk(0x10000);
+        let pattern: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+        file.write_all_at(&pattern, 0).unwrap();
+        queue_request(&mem, &vq, 0, 0, VIRTIO_BLK_T_IN, 3, 1024);
+
+        let log = Arc::new(Mutex::new(IoLog::default()));
+        let io = recording(&log);
+        let aligned = AlignedFile::with_alignment(file, Some(4096));
+        let mut handler = test_handler(&mem, &vq, io, true, false, Some(aligned));
+        handler.process_queue_submit().unwrap();
+
+        assert_eq!(vq.used.idx.get(), 1);
+        assert_eq!(mem.read_obj::<u8>(GuestAddress(status_addr(0))).unwrap(), 0);
+        let mut got = vec![0u8; 1024];
+        mem.read_slice(&mut got, GuestAddress(data_addr(0)))
+            .unwrap();
+        assert_eq!(got, pattern[1536..2560]);
+    }
+
+    #[test]
+    fn sub_alignment_request_waits_for_inflight_requests() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let vq = GuestQ::new(GuestAddress(0x1000), &mem, 8);
+        let file = memfd_disk(0x10000);
+        file.write_all_at(&[0xaa; 8192], 0).unwrap();
+        mem.write_slice(&[0x55; 512], GuestAddress(data_addr(3)))
+            .unwrap();
+        // An aligned 4K write, then a 512 byte write in the same block.
+        queue_request(&mem, &vq, 0, 0, VIRTIO_BLK_T_OUT, 0, 4096);
+        queue_request(&mem, &vq, 3, 1, VIRTIO_BLK_T_OUT, 1, 512);
+        vq.avail.idx.set(2);
+
+        let log = Arc::new(Mutex::new(IoLog::default()));
+        let io = recording(&log);
+        let aligned = AlignedFile::with_alignment(file.try_clone().unwrap(), Some(4096));
+        let mut handler = test_handler(&mem, &vq, io, true, false, Some(aligned));
+        handler.process_queue_submit().unwrap();
+
+        // The aligned request took the normal async path and is in flight;
+        // the unaligned one has not been consumed and the file is untouched.
+        assert_eq!(log.lock().unwrap().submitted.len(), 1);
+        assert_eq!(handler.inflight_requests.len(), 1);
+        assert_eq!(vq.used.idx.get(), 0);
+        let mut got = vec![0u8; 1024];
+        file.read_exact_at(&mut got, 0).unwrap();
+        assert!(got.iter().all(|b| *b == 0xaa));
+
+        // Once the in-flight request completes, the next submit runs it.
+        let op = log.lock().unwrap().submitted.pop().unwrap();
+        log.lock()
+            .unwrap()
+            .completions
+            .push_back(AsyncIoCompletion::from_operation(op, 4096));
+        handler.process_queue_complete().unwrap();
+        assert_eq!(vq.used.idx.get(), 1);
+        handler.process_queue_submit().unwrap();
+        assert_eq!(vq.used.idx.get(), 2);
+        assert_eq!(mem.read_obj::<u8>(GuestAddress(status_addr(3))).unwrap(), 0);
+        file.read_exact_at(&mut got, 0).unwrap();
+        assert!(got[..512].iter().all(|b| *b == 0xaa));
+        assert!(got[512..1024].iter().all(|b| *b == 0x55));
+    }
+
+    #[test]
+    fn aligned_request_uses_async_path_when_emulating() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let vq = GuestQ::new(GuestAddress(0x1000), &mem, 8);
+        let file = memfd_disk(0x10000);
+        queue_request(&mem, &vq, 0, 0, VIRTIO_BLK_T_OUT, 8, 4096);
+
+        let log = Arc::new(Mutex::new(IoLog::default()));
+        let io = recording(&log);
+        let aligned = AlignedFile::with_alignment(file, Some(4096));
+        let mut handler = test_handler(&mem, &vq, io, true, false, Some(aligned));
+        handler.process_queue_submit().unwrap();
+
+        assert_eq!(log.lock().unwrap().submitted.len(), 1);
+        assert_eq!(vq.used.idx.get(), 0);
+    }
+
+    #[test]
+    fn emulation_only_for_direct_backends_below_their_block_size() {
+        // Non-direct backend reporting 4096 logical with guest 512: accepted
+        // as before, no emulation (and so no single queue requirement).
+        assert!(!needs_unaligned_emulation(Some(512), 4096, false));
+        assert!(needs_unaligned_emulation(Some(512), 4096, true));
+        assert!(!needs_unaligned_emulation(Some(4096), 4096, true));
+        assert!(!needs_unaligned_emulation(None, 4096, true));
+    }
+
+    #[test]
+    fn no_emulation_when_backend_block_size_is_not_larger() {
+        // The backend block size here is 512, so guest_block_size=512 is not
+        // below it and nothing is emulated, whatever the queue count.
+        let block = |queues, direct| {
+            Block::new(
+                "test".to_owned(),
+                Box::new(RawDisk::new(memfd_disk(1 << 20), RawBackend::Sync, direct)),
+                PathBuf::from("/test"),
+                false,
+                false,
+                queues,
+                128,
+                None,
+                SeccompAction::Allow,
+                None,
+                EventFd::new(EFD_NONBLOCK).unwrap(),
+                None,
+                BTreeMap::new(),
+                true,
+                LockGranularityChoice::default(),
+                Some(512),
+                true,
+            )
+        };
+        assert!(!block(1, false).unwrap().emulate_unaligned);
+        assert!(!block(2, false).unwrap().emulate_unaligned);
     }
 }

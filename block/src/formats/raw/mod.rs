@@ -159,6 +159,17 @@ impl disk_file::AsyncDiskFile for RawDisk {
             RawBackend::Aio => Ok(Box::new(RawAio::new(file, self.direct, ring_depth)?)),
         }
     }
+
+    fn unaligned_io_file(&self) -> BlockResult<Option<AlignedFile>> {
+        if !self.direct {
+            return Ok(None);
+        }
+        let file = self
+            .file
+            .try_clone()
+            .map_err(|e| BlockError::new(BlockErrorKind::Io, DiskFileError::Clone(e)))?;
+        Ok(Some(AlignedFile::new(file, true)))
+    }
 }
 
 #[cfg(test)]

@@ -226,9 +226,12 @@ pub enum DeviceManagerError {
     #[error("Cannot create virtio-blk device")]
     CreateVirtioBlock(#[source] io::Error),
 
-    /// Unsupported under direct I/O
+    /// Unsupported under direct I/O for anything but raw images
     #[error("Disk guest_block_size is below the required backend block size")]
     GuestBlockSizeBelowBackend,
+
+    #[error("Disk guest_block_size below the backend block size requires num_queues=1")]
+    GuestBlockSizeBelowBackendMultiQueue,
 
     /// Cannot create virtio-net device
     #[error("Cannot create virtio-net device")]
@@ -2899,7 +2902,14 @@ impl DeviceManager {
                     || matches!(disk_cfg.image_type, ImageType::Raw | ImageType::FixedVhd))
                 && u64::from(guest_block_size) < disk.topology().logical_block_size
             {
-                return Err(DeviceManagerError::GuestBlockSizeBelowBackend);
+                // Raw images serve the sub-alignment I/O by read-modify-write,
+                // which is only race free on a single queue.
+                if disk_cfg.image_type != ImageType::Raw {
+                    return Err(DeviceManagerError::GuestBlockSizeBelowBackend);
+                }
+                if disk_cfg.num_queues != 1 {
+                    return Err(DeviceManagerError::GuestBlockSizeBelowBackendMultiQueue);
+                }
             }
 
             if disk_cfg.backing_files

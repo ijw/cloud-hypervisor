@@ -37,7 +37,7 @@
 use std::fmt::Debug;
 
 use crate::async_io::{AsyncIo, BorrowedDiskFd};
-use crate::{BlockResult, DiskTopology};
+use crate::{AlignedFile, BlockResult, DiskTopology};
 
 /// Reported capacity of a disk image.
 pub trait DiskSize: Send + Debug {
@@ -153,6 +153,16 @@ pub trait AsyncDiskFile: DiskFile + Unpin {
     ///   than zero. Backends that do not use an async ring (e.g. sync
     ///   fallback implementations) may ignore this value.
     fn create_async_io(&self, ring_depth: u32) -> BlockResult<Box<dyn AsyncIo>>;
+
+    /// Returns a handle that performs read-modify-write for I/O smaller than
+    /// the backend's O_DIRECT alignment, or `None` if the backend cannot.
+    ///
+    /// The virtio-blk device uses it to serve guest block sizes below the
+    /// backend block size. It must not run concurrently with other I/O to the
+    /// same blocks, so the caller serialises it against its async requests.
+    fn unaligned_io_file(&self) -> BlockResult<Option<AlignedFile>> {
+        Ok(None)
+    }
 }
 
 /// Full capability async disk file trait.

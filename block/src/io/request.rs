@@ -418,6 +418,15 @@ impl Request {
         Ok(ret)
     }
 
+    /// True when the request's starting offset and total length both satisfy
+    /// `alignment` (`None` means no alignment is required).
+    pub fn data_is_aligned(&self, alignment: Option<u64>) -> bool {
+        alignment.is_none_or(|alignment| {
+            (self.sector << SECTOR_SHIFT).is_multiple_of(alignment)
+                && (self.data_len() as u64).is_multiple_of(alignment)
+        })
+    }
+
     // Builds a read or write operation for IO to or from `mem`.
     fn build_data_operation<B: Bitmap + Send + Sync + 'static>(
         &self,
@@ -757,6 +766,30 @@ mod tests {
                 _ => panic!("Expected an owned bounce buffer"),
             }
         }
+    }
+
+    #[test]
+    fn data_is_aligned_checks_offset_and_total_length() {
+        let request = |sector, lens: &[u32]| Request {
+            request_type: RequestType::Out,
+            sector,
+            data_descriptors: lens
+                .iter()
+                .map(|len| (GuestAddress(0), *len))
+                .collect::<SmallVec<_>>(),
+            status_addr: GuestAddress(0),
+            writeback: true,
+            start: Instant::now(),
+        };
+
+        assert!(request(8, &[4096]).data_is_aligned(Some(4096)));
+        // Split across descriptors, but the total is aligned.
+        assert!(request(8, &[512, 3584]).data_is_aligned(Some(4096)));
+        assert!(!request(1, &[4096]).data_is_aligned(Some(4096)));
+        assert!(!request(8, &[512]).data_is_aligned(Some(4096)));
+        assert!(!request(8, &[4096, 512]).data_is_aligned(Some(4096)));
+        // No O_DIRECT, so everything is aligned.
+        assert!(request(1, &[512]).data_is_aligned(None));
     }
 
     #[test]
