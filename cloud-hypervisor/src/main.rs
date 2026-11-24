@@ -975,9 +975,13 @@ fn main() {
     #[cfg(feature = "dhat-heap")]
     let _profiler = dhat::Profiler::new_heap();
 
-    // Ensure all created files (.e.g sockets) are only accessible by this user
+    // Ensure created files (e.g. sockets) are never accessible to others. The
+    // inherited umask is kept otherwise, so a launcher can share sockets with a
+    // group (microrunner runs CH under its own uid with umask 0o007).
     // SAFETY: trivially safe
-    let _ = unsafe { libc::umask(0o077) };
+    let inherited = unsafe { libc::umask(0o077) };
+    // SAFETY: trivially safe
+    let _ = unsafe { libc::umask(inherited | 0o007) };
 
     let (default_vcpus, default_memory, default_rng) = prepare_default_values();
     let cmd_arguments = create_app(default_vcpus, default_memory, default_rng).get_matches();
